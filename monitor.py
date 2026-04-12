@@ -561,17 +561,17 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             next_earnings_date = m.earnings.expected_report_date  # a date object
 
         # Option chain structure
-chain_list = await NestedOptionChain.get(session, ticker)
+        chain_list = await NestedOptionChain.get(session, ticker)
 
-if not chain_list:
-    log.warning(f"  {ticker}: no option chain returned")
-    return None
+        if not chain_list:
+            log.warning(f"  {ticker}: no option chain returned")
+            return None
 
-chain = chain_list[0]
+        chain = chain_list[0]
 
-if not chain.expirations:
-    log.warning(f"  {ticker}: no expirations")
-    return None
+        if not chain.expirations:
+            log.warning(f"  {ticker}: no expirations")
+            return None
 
         expirations, exp_map = [], {}
         for exp in chain.expirations:
