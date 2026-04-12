@@ -562,14 +562,7 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
 
         # Option chain structure
         chain = await NestedOptionChain.get(session, ticker)
-
-        if isinstance(chain, list):
-            if not chain:
-                log.warning(f"  {ticker}: no option chain returned")
-                return None
-            chain = chain[0]
-
-        if not getattr(chain, "expirations", None):
+        if not chain.expirations:
             log.warning(f"  {ticker}: no expirations")
             return None
 
@@ -708,38 +701,51 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
         call_rows, put_rows = [], []
 
         for sym, strike in em.get("calls", {}).items():
-            q = quotes.get(sym)
-            g = greeks_map.get(sym)
+            q  = quotes.get(sym)
+            g  = greeks_map.get(sym)
+            sm = summary_map.get(sym)
             bid = float(q.bid_price or 0) if q else 0.0
             ask = float(q.ask_price or 0) if q else 0.0
-            if bid > 0 or ask > 0:
-                sm = summary_map.get(sym)
-                call_rows.append({
-                    "strike":            strike,
-                    "bid":               bid,
-                    "ask":               ask,
-                    "lastPrice":         (bid + ask) / 2 if ask > 0 else bid,
-                    "impliedVolatility": max(0.01, float(g.volatility or iv_current) if g else iv_current),
-                    "delta":             float(g.delta or 0.5) if g else 0.5,
-                    "openInterest":      int(sm.open_interest or 0) if sm else 0,
-                })
+
+            # Weekend/after-hours fallback: use last close price from Summary
+            last_price = (bid + ask) / 2 if ask > 0 else bid
+            if last_price <= 0 and sm:
+                last_price = float(sm.day_close_price or sm.prev_day_close_price or 0)
+            if last_price <= 0:
+                continue  # truly no data for this contract
+
+            call_rows.append({
+                "strike":            strike,
+                "bid":               bid if bid > 0 else last_price * 0.98,
+                "ask":               ask if ask > 0 else last_price * 1.02,
+                "lastPrice":         last_price,
+                "impliedVolatility": max(0.01, float(g.volatility or iv_current) if g else iv_current),
+                "delta":             float(g.delta or 0.5) if g else 0.5,
+                "openInterest":      int(sm.open_interest or 0) if sm else 0,
+            })
 
         for sym, strike in em.get("puts", {}).items():
-            q = quotes.get(sym)
-            g = greeks_map.get(sym)
+            q  = quotes.get(sym)
+            g  = greeks_map.get(sym)
+            sm = summary_map.get(sym)
             bid = float(q.bid_price or 0) if q else 0.0
             ask = float(q.ask_price or 0) if q else 0.0
-            if bid > 0 or ask > 0:
-                sm = summary_map.get(sym)
-                put_rows.append({
-                    "strike":            strike,
-                    "bid":               bid,
-                    "ask":               ask,
-                    "lastPrice":         (bid + ask) / 2 if ask > 0 else bid,
-                    "impliedVolatility": max(0.01, float(g.volatility or iv_current) if g else iv_current),
-                    "delta":             float(g.delta or -0.5) if g else -0.5,
-                    "openInterest":      int(sm.open_interest or 0) if sm else 0,
-                })
+
+            last_price = (bid + ask) / 2 if ask > 0 else bid
+            if last_price <= 0 and sm:
+                last_price = float(sm.day_close_price or sm.prev_day_close_price or 0)
+            if last_price <= 0:
+                continue
+
+            put_rows.append({
+                "strike":            strike,
+                "bid":               bid if bid > 0 else last_price * 0.98,
+                "ask":               ask if ask > 0 else last_price * 1.02,
+                "lastPrice":         last_price,
+                "impliedVolatility": max(0.01, float(g.volatility or iv_current) if g else iv_current),
+                "delta":             float(g.delta or -0.5) if g else -0.5,
+                "openInterest":      int(sm.open_interest or 0) if sm else 0,
+            })
 
         if not call_rows or not put_rows:
             log.warning(f"  {ticker}: insufficient options data for {best_exp}")
