@@ -788,7 +788,9 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
         }
 
     except Exception as e:
-        log.error(f"  {ticker}: fetch failed — {e}")
+        import traceback
+        log.error(f"  {ticker}: fetch failed — {type(e).__name__}: {e}")
+        log.error(traceback.format_exc())
         return None
 
 
