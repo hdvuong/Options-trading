@@ -54,6 +54,20 @@ jobs:
           key: alert-state-${{ github.run_id }}
           restore-keys: alert-state-
 
+      - name: Fix indentation in Python files
+        run: |
+          python3 -c "
+import sys
+for fname in ['monitor.py', 'positions.py']:
+    with open(fname, 'r') as f:
+        content = f.read()
+    fixed = content.expandtabs(4)
+    with open(fname, 'w') as f:
+        f.write(fixed)
+    tabs = content.count(chr(9))
+    print(f'{fname}: replaced {tabs} tab(s)')
+"
+
       - name: Run monitor (scheduled)
         if: github.event_name == 'schedule'
         env:
@@ -125,6 +139,20 @@ jobs:
           path: position_state.json
           key: position-state-${{ github.run_id }}
           restore-keys: position-state-
+
+      - name: Fix indentation in Python files
+        run: |
+          python3 -c "
+import sys
+for fname in ['monitor.py', 'positions.py']:
+    with open(fname, 'r') as f:
+        content = f.read()
+    fixed = content.expandtabs(4)
+    with open(fname, 'w') as f:
+        f.write(fixed)
+    tabs = content.count(chr(9))
+    print(f'{fname}: replaced {tabs} tab(s)')
+"
 
       - name: Check open positions
         env:
