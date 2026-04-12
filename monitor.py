@@ -541,7 +541,7 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
     """
     scan_cfg     = cfg.get("scan", {})
     max_exps     = scan_cfg.get("max_expirations", 8)
-    timeout      = scan_cfg.get("stream_timeout_seconds", 20)
+    timeout      = scan_cfg.get("stream_timeout_seconds", 40)   # raised default
     target_dte   = scan_cfg.get("target_dte", 35)
 
     try:
@@ -561,17 +561,17 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             next_earnings_date = m.earnings.expected_report_date  # a date object
 
         # Option chain structure
-        chain = await NestedOptionChain.get(session, ticker)
+	chain = await NestedOptionChain.get(session, ticker)
 
-        if isinstance(chain, list):
-            if not chain:
-                log.warning(f"  {ticker}: no option chain returned")
-                return None
-            chain = chain[0]
+	if isinstance(chain, list):
+    		if not chain:
+        		log.warning(f"  {ticker}: no option chain returned")
+        		return None
+    		chain = chain[0]
 
-        if not getattr(chain, "expirations", None):
-            log.warning(f"  {ticker}: no expirations")
-            return None
+	if not getattr(chain, "expirations", None):
+    		log.warning(f"  {ticker}: no expirations")
+    		return None
 
         expirations, exp_map = [], {}
         for exp in chain.expirations:
@@ -589,15 +589,15 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             log.warning(f"  {ticker}: no suitable expiry")
             return None
 
-        # Streamer symbols
+        # Streamer symbols — only stream the ONE expiry we need for scoring
+        # This reduces symbol count from ~800 to ~100, critical for weekend reliability
         equity     = await Equity.get(session, ticker)
         equity_sym = equity.streamer_symbol
-        stream_exps = expirations[:max_exps]
         option_syms = []
-        for exp_str in stream_exps:
-            em = exp_map.get(exp_str, {})
-            option_syms.extend(em.get("calls", {}).keys())
-            option_syms.extend(em.get("puts",  {}).keys())
+        em_best = exp_map.get(best_exp, {})
+        option_syms.extend(em_best.get("calls", {}).keys())
+        option_syms.extend(em_best.get("puts",  {}).keys())
+        log.info(f"  {ticker}: streaming {len(option_syms)} contracts for {best_exp}")
 
         # Stream live data
         price = week52_high = week52_low = 0.0
