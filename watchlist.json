@@ -1,0 +1,23 @@
+{
+  "tickers": ["NVDA", "AAPL", "MSFT", "SPY", "QQQ"],
+
+  "alert": {
+    "score_threshold": 65,
+    "strategies": ["Long Call", "Bull Call Spread", "Cash-Secured Put", "Iron Condor"],
+    "cooldown_minutes": 120,
+    "rescore_if_change": 10
+  },
+
+  "scan": {
+    "target_dte": 35,
+    "max_expirations": 8,
+    "stream_timeout_seconds": 20
+  },
+
+  "notes": {
+    "score_threshold": "Only alert when a trade scores >= this value (0-100)",
+    "cooldown_minutes": "Don't re-alert the same ticker+strategy within this window",
+    "rescore_if_change": "Override cooldown and re-alert if score changes by this many points",
+    "target_dte": "Prefer expirations closest to this many days out"
+  }
+}

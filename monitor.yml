@@ -1,0 +1,101 @@
+name: Options Monitor
+
+on:
+  schedule:
+    # Every 30 minutes, Mon–Fri, 1pm–9pm UTC
+    # Covers 9am–5pm ET in both EDT (UTC-4) and EST (UTC-5)
+    # The monitor.py script does a final market-hours check internally
+    - cron: "0,30 13-20 * * 1-5"
+
+  # Allow manual trigger from GitHub Actions UI
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "Single ticker to scan (leave empty for full watchlist)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Dry run — score without sending alerts"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      force:
+        description: "Force alerts — ignore cooldown"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+jobs:
+  scan:
+    name: Scan Options
+    runs-on: ubuntu-latest
+    timeout-minutes: 15    # kill if it hangs
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Persist alert_state.json between runs so cooldowns work
+      - name: Restore alert state cache
+        uses: actions/cache@v4
+        with:
+          path: alert_state.json
+          key: alert-state-${{ github.run_id }}
+          restore-keys: alert-state-
+
+      - name: Run monitor (scheduled)
+        if: github.event_name == 'schedule'
+        env:
+          TASTYTRADE_CLIENT_SECRET: ${{ secrets.TASTYTRADE_CLIENT_SECRET }}
+          TASTYTRADE_REFRESH_TOKEN: ${{ secrets.TASTYTRADE_REFRESH_TOKEN }}
+          TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Run monitor (manual trigger)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TASTYTRADE_CLIENT_SECRET: ${{ secrets.TASTYTRADE_CLIENT_SECRET }}
+          TASTYTRADE_REFRESH_TOKEN: ${{ secrets.TASTYTRADE_REFRESH_TOKEN }}
+          TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          ARGS=""
+          if [ -n "${{ github.event.inputs.ticker }}" ]; then
+            ARGS="$ARGS --ticker ${{ github.event.inputs.ticker }}"
+          fi
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          if [ "${{ github.event.inputs.force }}" == "true" ]; then
+            ARGS="$ARGS --force"
+          fi
+          python monitor.py $ARGS
+
+      # Upload monitor.log as an artifact for debugging
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-log-${{ github.run_id }}
+          path: monitor.log
+          retention-days: 7
+
+      # Save updated alert state
+      - name: Save alert state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: alert_state.json
+          key: alert-state-${{ github.run_id }}
