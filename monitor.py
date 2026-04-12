@@ -47,7 +47,8 @@ try:
     from tastytrade import Session, DXLinkStreamer
     from tastytrade.instruments import Equity, NestedOptionChain
     from tastytrade.metrics import get_market_metrics
-    from tastytrade.dxfeed import Quote, Greeks, Trade, Profile
+    from tastytrade.dxfeed import Quote, Greeks, Trade, Profile, Summary, Candle
+    from tastytrade.utils import is_market_open_now
 except ImportError:
     print("Run: pip install tastytrade")
     sys.exit(1)
@@ -80,38 +81,24 @@ def load_config() -> dict:
 
 
 # ─────────────────────────────────────────────
-# MARKET HOURS CHECK
+# MARKET STATUS
 # ─────────────────────────────────────────────
 
-def is_market_open() -> bool:
+def market_status() -> tuple[bool, str]:
     """
-    Returns True if US equity market is currently open (Mon-Fri, 9:30am-4pm ET).
-    Accounts for EDT (UTC-4) and EST (UTC-5) automatically.
-    Does NOT check holidays — add a holiday calendar if you want that.
+    Returns (is_open, label) using Tastytrade's own calendar.
+    When closed, we fall back to last-close prices so the scan
+    still runs and produces useful weekend research scores.
     """
-    now_utc = datetime.now(timezone.utc)
+    try:
+        open_now = is_market_open_now()
+    except Exception:
+        # If the SDK call fails, assume closed and continue anyway
+        open_now = False
 
-    # Skip weekends
-    if now_utc.weekday() >= 5:
-        return False
-
-    # Convert to ET (approximate — handles DST by checking month)
-    # EDT: Mar 2nd Sunday to Nov 1st Sunday (UTC-4)
-    # EST: rest of year (UTC-5)
-    month = now_utc.month
-    is_edt = 3 <= month <= 10  # rough approximation
-    et_offset = -4 if is_edt else -5
-    now_et = now_utc + timedelta(hours=et_offset)
-
-    market_open  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
-    market_close = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
-
-    return market_open <= now_et <= market_close
-
-
-def market_hours_str() -> str:
-    now = datetime.now(timezone.utc)
-    return f"{now.strftime('%Y-%m-%d %H:%M UTC')}"
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    label   = "OPEN" if open_now else "CLOSED (using last-close prices)"
+    return open_now, f"{now_str} — market {label}"
 
 
 # ─────────────────────────────────────────────
@@ -231,9 +218,11 @@ def format_alert(ticker: str, setup, reason: str) -> str:
     return "\n".join(lines)
 
 
-def format_summary(results: list, scan_time: str) -> str:
-    """Format a scan summary message (sent even if no high-score trades)."""
-    lines = [f"📋 *Options Scan — {scan_time}*", ""]
+def format_summary(results: list, scan_time: str, market_open: bool = True) -> str:
+    """Format a scan summary message (sent every scan)."""
+    status_icon = "🟢" if market_open else "🔴"
+    status_note = "" if market_open else " _(last-close prices)_"
+    lines = [f"📋 *Options Scan — {scan_time}* {status_icon}{status_note}", ""]
     if not results:
         lines.append("No tickers scanned.")
         return "\n".join(lines)
@@ -334,9 +323,9 @@ def d_at(df, strike):
 
 
 def score_setup(iv_rank, iv_current, hv_30d, trend_30d, strategy_type, dte,
-                max_gain, max_loss, p50) -> tuple[int, dict]:
-    """Score a trade setup 0-100 across 7 factors."""
-    r = 0.04  # risk-free rate (not used here directly)
+                max_gain, max_loss, p50, next_earnings_date=None,
+                open_interest=0) -> tuple[int, dict]:
+    """Score a trade setup 0-100 across 7 factors + earnings penalty."""
 
     # IV Rank (30pts)
     iv = iv_rank
@@ -366,7 +355,7 @@ def score_setup(iv_rank, iv_current, hv_30d, trend_30d, strategy_type, dte,
 
     # Trend (5pts)
     if trend_30d == 0:
-        tr_pts, tr_note = 3, "Trend n/a"
+        tr_pts, tr_note = 3, "Trend n/a (no candle data)"
     elif strategy_type == "buy_debit":
         tr_pts  = 5 if trend_30d >= 3 else 3 if trend_30d >= -2 else 1
         tr_note = f"Trend {trend_30d:+.1f}%"
@@ -374,8 +363,15 @@ def score_setup(iv_rank, iv_current, hv_30d, trend_30d, strategy_type, dte,
         tr_pts  = 5 if abs(trend_30d) < 3 else 2
         tr_note = f"Trend {trend_30d:+.1f}%"
 
-    # Liquidity (5pts) — OI not in streaming API
-    lq_pts, lq_note = 3, "OI not in streaming API"
+    # Liquidity (5pts) — from Summary OI
+    if open_interest >= 500:
+        lq_pts, lq_note = 5, f"OI {open_interest:,} — good liquidity"
+    elif open_interest >= 100:
+        lq_pts, lq_note = 3, f"OI {open_interest:,} — moderate liquidity"
+    elif open_interest > 0:
+        lq_pts, lq_note = 1, f"OI {open_interest:,} — thin, watch spreads"
+    else:
+        lq_pts, lq_note = 2, "OI unavailable — verify spreads before entry"
 
     # DTE Fit (10pts)
     if strategy_type == "buy_debit":
@@ -385,6 +381,26 @@ def score_setup(iv_rank, iv_current, hv_30d, trend_30d, strategy_type, dte,
     dt_note = f"{dte} DTE"
 
     total = min(100, iv_pts + rr_pts + p50_pts + hv_pts + tr_pts + lq_pts + dt_pts)
+
+    # Earnings penalty — applied AFTER total (can push score below threshold)
+    earnings_note = None
+    if next_earnings_date:
+        from datetime import date as date_type
+        today    = datetime.now().date()
+        earn_dt  = next_earnings_date if isinstance(next_earnings_date, date_type) else next_earnings_date
+        days_to_earn = (earn_dt - today).days
+        if 0 <= days_to_earn <= dte:
+            # Earnings fall WITHIN the trade's lifespan
+            if strategy_type == "sell_credit":
+                # Sellers hate earnings — unexpected moves can blow through spreads
+                penalty = 20
+                earnings_note = f"⚠️ EARNINGS in {days_to_earn}d (exp {earn_dt}) — high risk for sellers, -{penalty}pts"
+            else:
+                # Buyers can benefit from IV expansion into earnings
+                penalty = -5  # slight bonus
+                earnings_note = f"📅 EARNINGS in {days_to_earn}d (exp {earn_dt}) — IV may expand, +5pts for buyers"
+            total = max(0, min(100, total - penalty))
+
     breakdown = {
         "IV Rank (30pts)":     (iv_pts,  iv_note),
         "Risk/Reward (20pts)": (rr_pts,  rr_note),
@@ -394,6 +410,9 @@ def score_setup(iv_rank, iv_current, hv_30d, trend_30d, strategy_type, dte,
         "Liquidity (5pts)":    (lq_pts,  lq_note),
         "DTE Fit (10pts)":     (dt_pts,  dt_note),
     }
+    if earnings_note:
+        breakdown["Earnings"] = (0, earnings_note)
+
     return total, breakdown
 
 
@@ -426,14 +445,18 @@ def build_setups(snap: dict) -> list[TradeSetup]:
     T         = dte / 365
     calls     = snap["calls"]
     puts      = snap["puts"]
+    earnings  = snap.get("next_earnings_date")
 
-    def make(name, stype, legs, premium, max_gain, max_loss, breakeven, delta_net, p50, iv_used):
-        score, bd = score_setup(iv_rank, iv_cur, hv, trend, stype, dte, max_gain, max_loss, p50)
+    def make(name, stype, legs, premium, max_gain, max_loss, breakeven,
+             delta_net, p50, iv_used, oi=0):
+        score, bd = score_setup(iv_rank, iv_cur, hv, trend, stype, dte,
+                                max_gain, max_loss, p50,
+                                next_earnings_date=earnings, open_interest=oi)
         verdict   = ("STRONG SETUP" if score >= 65 else "NEUTRAL" if score >= 45 else "AVOID")
         s = TradeSetup(
             name=name, strategy_type=stype, expiry=expiry, dte=dte, legs=legs,
             premium=premium, max_gain=max_gain, max_loss=max_loss, breakeven=breakeven,
-            delta_net=delta_net, p50=p50, iv_used=iv_used, open_interest=0,
+            delta_net=delta_net, p50=p50, iv_used=iv_used, open_interest=oi,
             score=score, score_breakdown=bd, verdict=verdict, exit_rules={},
         )
         s.exit_rules = exit_rules(s)
@@ -444,9 +467,10 @@ def build_setups(snap: dict) -> list[TradeSetup]:
         iv = iv_at(calls, K, iv_cur)
         p  = mid(calls, K) or bs_price(price, K, T, 0.04, iv, "call")
         d  = d_at(calls, K) or bs_delta(price, K, T, 0.04, iv, "call")
+        oi = int(calls[calls["strike"] == K]["openInterest"].values[0]) if not calls[calls["strike"] == K].empty else 0
         setups.append(make("Long Call", "buy_debit",
             [f"BUY ${K:.0f}C exp {expiry}"],
-            p, price * 0.5, p, K + p, d, max(0.1, d * 0.85), iv))
+            p, price * 0.5, p, K + p, d, max(0.1, d * 0.85), iv, oi))
     except Exception as e:
         log.debug(f"Long Call skipped: {e}")
 
@@ -458,9 +482,13 @@ def build_setups(snap: dict) -> list[TradeSetup]:
         debit = max(0.01, p1 - p2)
         d1 = d_at(calls, K1) or bs_delta(price, K1, T, 0.04, iv1, "call")
         d2 = d_at(calls, K2) or bs_delta(price, K2, T, 0.04, iv2, "call")
+        oi = min(
+            int(calls[calls["strike"] == K1]["openInterest"].values[0]) if not calls[calls["strike"] == K1].empty else 0,
+            int(calls[calls["strike"] == K2]["openInterest"].values[0]) if not calls[calls["strike"] == K2].empty else 0,
+        )
         setups.append(make("Bull Call Spread", "buy_debit",
             [f"BUY ${K1:.0f}C / SELL ${K2:.0f}C exp {expiry}"],
-            debit, (K2 - K1) - debit, debit, K1 + debit, d1 - d2, max(0.1, d1 * 0.8), iv1))
+            debit, (K2 - K1) - debit, debit, K1 + debit, d1 - d2, max(0.1, d1 * 0.8), iv1, oi))
     except Exception as e:
         log.debug(f"Bull Call Spread skipped: {e}")
 
@@ -469,9 +497,10 @@ def build_setups(snap: dict) -> list[TradeSetup]:
         iv = iv_at(puts, K, iv_cur)
         p  = mid(puts, K) or bs_price(price, K, T, 0.04, iv, "put")
         d  = d_at(puts, K) or bs_delta(price, K, T, 0.04, iv, "put")
+        oi = int(puts[puts["strike"] == K]["openInterest"].values[0]) if not puts[puts["strike"] == K].empty else 0
         setups.append(make("Cash-Secured Put", "sell_credit",
             [f"SELL ${K:.0f}P exp {expiry}"],
-            p, p, K - p, K - p, d, max(0.1, (1 + d) * 0.85), iv))
+            p, p, K - p, K - p, d, max(0.1, (1 + d) * 0.85), iv, oi))
     except Exception as e:
         log.debug(f"CSP skipped: {e}")
 
@@ -486,9 +515,13 @@ def build_setups(snap: dict) -> list[TradeSetup]:
         dcs = d_at(calls, Kcs) or bs_delta(price, Kcs, T, 0.04, iv_at(calls, Kcs, iv_cur), "call")
         dps = d_at(puts, Kps) or bs_delta(price, Kps, T, 0.04, iv_ps, "put")
         p50 = max(0.1, (1 - abs(dcs)) * (1 - abs(dps)) * 0.85)
+        oi = min(
+            int(puts[puts["strike"]  == Kps]["openInterest"].values[0]) if not puts[puts["strike"]  == Kps].empty else 0,
+            int(calls[calls["strike"] == Kcs]["openInterest"].values[0]) if not calls[calls["strike"] == Kcs].empty else 0,
+        )
         s = make("Iron Condor", "sell_credit",
             [f"SELL ${Kps:.0f}P/BUY ${Kpb:.0f}P  SELL ${Kcs:.0f}C/BUY ${Kcb:.0f}C exp {expiry}"],
-            credit, credit, max(ml, 0.01), Kps - credit, dcs + dps, p50, iv_ps)
+            credit, credit, max(ml, 0.01), Kps - credit, dcs + dps, p50, iv_ps, oi)
         s.exit_rules["profit_zone"] = f"${Kps - credit:.2f} – ${Kcs + credit:.2f}"
         setups.append(s)
     except Exception as e:
@@ -521,6 +554,11 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
         iv_rank    = float(m.tw_implied_volatility_index_rank or 50)
         iv_current = float(m.implied_volatility_30_day        or 0.30)
         hv_30d     = float(m.historical_volatility_30_day     or 0.25)
+
+        # Earnings — extract next expected report date
+        next_earnings_date = None
+        if m.earnings and m.earnings.expected_report_date:
+            next_earnings_date = m.earnings.expected_report_date  # a date object
 
         # Option chain structure
         chain = await NestedOptionChain.get(session, ticker)
@@ -556,19 +594,30 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
 
         # Stream live data
         price = week52_high = week52_low = 0.0
-        quotes, greeks_map = {}, {}
+        prev_close = 0.0
+        trend_30d  = 0.0
+        quotes, greeks_map, summary_map = {}, {}, {}
+        candle_closes: list[float] = []
 
         async with DXLinkStreamer(session) as streamer:
             await streamer.subscribe(Trade,   [equity_sym])
             await streamer.subscribe(Profile, [equity_sym])
+            await streamer.subscribe(Summary, [equity_sym])
             if option_syms:
-                await streamer.subscribe(Quote,  option_syms)
-                await streamer.subscribe(Greeks, option_syms)
+                await streamer.subscribe(Quote,   option_syms)
+                await streamer.subscribe(Greeks,  option_syms)
+                await streamer.subscribe(Summary, option_syms)
+
+            # Daily candles for trend — last 32 days (covers 30 trading days)
+            candle_start = datetime.now(timezone.utc) - timedelta(days=32)
+            await streamer.subscribe_candle([equity_sym], interval="1d",
+                                            start_time=candle_start)
 
             deadline        = time.time() + timeout
             got_price       = got_profile = False
             pending_g       = set(option_syms)
             pending_q       = set(option_syms)
+            pending_s       = set(option_syms)
 
             while time.time() < deadline:
                 if not got_price:
@@ -578,6 +627,17 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
                             price     = float(ev.price)
                             got_price = price > 0
                     except Exception: pass
+
+                # Also drain Summary for equity (prev close fallback + equity OI)
+                try:
+                    ev = streamer.get_event_nowait(Summary)
+                    if ev.event_symbol == equity_sym:
+                        if not prev_close and ev.prev_day_close_price:
+                            prev_close = float(ev.prev_day_close_price)
+                    else:
+                        summary_map[ev.event_symbol] = ev
+                        pending_s.discard(ev.event_symbol)
+                except Exception: pass
 
                 if not got_profile:
                     try:
@@ -602,13 +662,36 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
                         pending_q.discard(ev.event_symbol)
                     except Exception: break
 
+                # Candle events — collect daily closes for trend
+                while True:
+                    try:
+                        ev = streamer.get_event_nowait(Candle)
+                        if ev.event_symbol.startswith(equity_sym) and ev.close:
+                            candle_closes.append(float(ev.close))
+                    except Exception: break
+
                 if got_price and got_profile and not pending_g and not pending_q:
                     break
                 await asyncio.sleep(0.15)
 
+        # Price fallback: use prev_day_close when market is closed (weekends/holidays)
+        market_open, market_label = market_status()
         if price <= 0:
-            log.warning(f"  {ticker}: could not get live price (market closed?)")
-            return None
+            if prev_close > 0:
+                price = prev_close
+                log.info(f"  {ticker}: market closed — using last close ${price:.2f}")
+            else:
+                log.warning(f"  {ticker}: no price available")
+                return None
+
+        # 30-day trend from candles
+        if len(candle_closes) >= 2:
+            # candles arrive oldest→newest; take first and last valid closes
+            close_old  = candle_closes[0]
+            close_new  = candle_closes[-1]
+            if close_old > 0:
+                trend_30d = (close_new - close_old) / close_old * 100
+        log.debug(f"  {ticker}: trend_30d={trend_30d:+.1f}% ({len(candle_closes)} candles)")
 
         if week52_high <= 0: week52_high = price * 1.3
         if week52_low  <= 0: week52_low  = price * 0.7
@@ -623,6 +706,7 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             bid = float(q.bid_price or 0) if q else 0.0
             ask = float(q.ask_price or 0) if q else 0.0
             if bid > 0 or ask > 0:
+                sm = summary_map.get(sym)
                 call_rows.append({
                     "strike":            strike,
                     "bid":               bid,
@@ -630,7 +714,7 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
                     "lastPrice":         (bid + ask) / 2 if ask > 0 else bid,
                     "impliedVolatility": max(0.01, float(g.volatility or iv_current) if g else iv_current),
                     "delta":             float(g.delta or 0.5) if g else 0.5,
-                    "openInterest":      0,
+                    "openInterest":      int(sm.open_interest or 0) if sm else 0,
                 })
 
         for sym, strike in em.get("puts", {}).items():
@@ -639,6 +723,7 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             bid = float(q.bid_price or 0) if q else 0.0
             ask = float(q.ask_price or 0) if q else 0.0
             if bid > 0 or ask > 0:
+                sm = summary_map.get(sym)
                 put_rows.append({
                     "strike":            strike,
                     "bid":               bid,
@@ -646,7 +731,7 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
                     "lastPrice":         (bid + ask) / 2 if ask > 0 else bid,
                     "impliedVolatility": max(0.01, float(g.volatility or iv_current) if g else iv_current),
                     "delta":             float(g.delta or -0.5) if g else -0.5,
-                    "openInterest":      0,
+                    "openInterest":      int(sm.open_interest or 0) if sm else 0,
                 })
 
         if not call_rows or not put_rows:
@@ -654,19 +739,21 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             return None
 
         return {
-            "ticker":             ticker,
-            "price":              price,
-            "week52_high":        week52_high,
-            "week52_low":         week52_low,
-            "iv_rank":            iv_rank,
-            "iv_current":         iv_current,
+            "ticker":              ticker,
+            "price":               price,
+            "week52_high":         week52_high,
+            "week52_low":          week52_low,
+            "iv_rank":             iv_rank,
+            "iv_current":          iv_current,
             "hist_volatility_30d": hv_30d,
-            "trend_30d":          0.0,
-            "expiry":             best_exp,
-            "dte":                days_to_expiry(best_exp),
-            "calls":              pd.DataFrame(call_rows).sort_values("strike").reset_index(drop=True),
-            "puts":               pd.DataFrame(put_rows).sort_values("strike").reset_index(drop=True),
-            "expirations":        expirations,
+            "trend_30d":           trend_30d,
+            "next_earnings_date":  next_earnings_date,
+            "expiry":              best_exp,
+            "dte":                 days_to_expiry(best_exp),
+            "calls":               pd.DataFrame(call_rows).sort_values("strike").reset_index(drop=True),
+            "puts":                pd.DataFrame(put_rows).sort_values("strike").reset_index(drop=True),
+            "expirations":         expirations,
+            "market_open":         market_open,
         }
 
     except Exception as e:
@@ -693,6 +780,7 @@ async def run_scan(tickers: list[str], session: Session, cfg: dict,
     scan_time = datetime.now().strftime("%b %d %H:%M ET")
     results   = []
     alerts_sent = 0
+    scan_market_open = True  # updated from first successful fetch
 
     log.info(f"Scanning {len(tickers)} tickers | threshold={threshold} | dry_run={dry_run}")
 
@@ -705,6 +793,7 @@ async def run_scan(tickers: list[str], session: Session, cfg: dict,
 
         setups = build_setups(snap)
         results.append((ticker, setups))
+        scan_market_open = snap.get("market_open", True)
 
         log.info(f"    {ticker} @ ${snap['price']:.2f} | IV Rank {snap['iv_rank']:.0f} | "
                  f"exp {snap['expiry']} ({snap['dte']} DTE)")
@@ -747,7 +836,7 @@ async def run_scan(tickers: list[str], session: Session, cfg: dict,
 
     # Send scan summary to Telegram
     if has_tg and not dry_run:
-        summary = format_summary(results, scan_time)
+        summary = format_summary(results, scan_time, market_open=scan_market_open)
         send_telegram(summary, bot_token, chat_id)
 
     log.info(f"Scan complete — {alerts_sent} alerts sent")
@@ -768,18 +857,14 @@ def main():
                         help="Ignore cooldown — re-alert everything above threshold")
     parser.add_argument("--sandbox",  action="store_true",
                         help="Use Tastytrade sandbox environment")
-    parser.add_argument("--skip-hours-check", action="store_true",
-                        help="Run even outside market hours (useful for testing)")
     args = parser.parse_args()
 
     load_dotenv()
     cfg = load_config()
 
-    # Market hours gate
-    if not args.skip_hours_check:
-        if not is_market_open():
-            log.info(f"Market closed at {market_hours_str()} — exiting. Use --skip-hours-check to override.")
-            sys.exit(0)
+    # Log market status — but always continue (weekends use last-close prices)
+    market_open, market_label = market_status()
+    log.info(market_label)
 
     # Auth
     client_secret = os.getenv("TASTYTRADE_CLIENT_SECRET")

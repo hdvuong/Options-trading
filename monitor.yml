@@ -2,10 +2,10 @@ name: Options Monitor
 
 on:
   schedule:
-    # Every 30 minutes, Mon–Fri, 1pm–9pm UTC
-    # Covers 9am–5pm ET in both EDT (UTC-4) and EST (UTC-5)
-    # The monitor.py script does a final market-hours check internally
-    - cron: "0,30 13-20 * * 1-5"
+    # Every 30 minutes, 1pm–9pm UTC, every day including weekends
+    # Mon–Fri: live prices during market hours (9:30am–4pm ET)
+    # Weekends/after-hours: uses last-close prices for research scanning
+    - cron: "0,30 13-20 * * *"
 
   # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
@@ -99,3 +99,52 @@ jobs:
         with:
           path: alert_state.json
           key: alert-state-${{ github.run_id }}
+
+  # ── Job 2: Positions Monitor ─────────────────────────────────────────────
+  positions:
+    name: Check Positions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore position state cache
+        uses: actions/cache@v4
+        with:
+          path: position_state.json
+          key: position-state-${{ github.run_id }}
+          restore-keys: position-state-
+
+      - name: Check open positions
+        env:
+          TASTYTRADE_CLIENT_SECRET: ${{ secrets.TASTYTRADE_CLIENT_SECRET }}
+          TASTYTRADE_REFRESH_TOKEN: ${{ secrets.TASTYTRADE_REFRESH_TOKEN }}
+          TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python positions.py
+
+      - name: Upload position logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: positions-log-${{ github.run_id }}
+          path: positions.log
+          retention-days: 7
+
+      - name: Save position state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: position_state.json
+          key: position-state-${{ github.run_id }}

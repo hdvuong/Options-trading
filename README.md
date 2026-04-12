@@ -80,24 +80,75 @@ pip install -r requirements.txt
 cp .env.example .env
 # Fill in your credentials
 
-# Dry run (no alerts sent)
-python monitor.py --dry-run --skip-hours-check
+# Dry run scan (no alerts sent)
+python monitor.py --dry-run
 
 # Test a single ticker
-python monitor.py --ticker NVDA --dry-run --skip-hours-check
+python monitor.py --ticker NVDA --dry-run
 
 # Force alerts (ignore cooldown)
-python monitor.py --force --skip-hours-check
+python monitor.py --force
 
-# Real run with alerts
-python monitor.py --skip-hours-check
+# Check open positions
+python positions.py --dry-run
+
+# Use sandbox environment
+python monitor.py --sandbox --dry-run
+python positions.py --sandbox --dry-run
 ```
 
 ---
 
 ## Telegram message examples
 
-**Alert (score ≥ threshold):**
+**Positions summary (every scan):**
+```
+📊 Positions — Apr 13 09:30 ET
+
+• NVDA L $195C exp 2026-05-15 (33d)  +$420 (+65%)
+• AAPL S $180P exp 2026-04-24 (12d) ⏰  +$88 (+55%)
+
+Total unrealized: +$508
+Apr 13 09:30 ET
+```
+
+**Position alert — take profit:**
+```
+🎯 NVDA — TAKE PROFIT
+
+Position: LONG 2x NVDA  260515C00195000
+Strike: $195 Call  ·  Exp: 2026-05-15 (33 DTE)
+
+Avg Open:  $6.50  ($650/contract)
+Mark Now:  $13.20  ($1,320/contract)
+Unrealized P&L: +$1,340 (+103%)
+
+Signal: Take profit hit — mark $13.20 ≥ target $13.00
+
+Greeks: Δ +0.62  θ -0.18  IV 41%
+
+Apr 13 10:00 ET
+```
+
+**Position alert — time stop:**
+```
+⏰ AAPL — TIME STOP
+
+Position: SHORT 1x AAPL  260424P00180000
+Strike: $180 Put  ·  Exp: 2026-04-24 (12 DTE)
+
+Avg Open:  $3.20  ($320/contract)
+Mark Now:  $1.45  ($145/contract)
+Unrealized P&L: +$175 (+55%)
+
+Signal: 12 DTE — theta accelerates, evaluate closing position
+
+Greeks: Δ -0.24  θ -0.31  IV 38%
+
+Apr 13 10:00 ET
+```
+
+**Trade scan alert (score ≥ threshold):**
 ```
 ✅ NVDA — Bull Call Spread 📊
 Score: 74/100 · first alert
@@ -118,25 +169,16 @@ Exit rules:
 Apr 12 09:30 ET
 ```
 
-**Summary (every scan):**
-```
-📋 Options Scan — Apr 12 09:30 ET
-
-• NVDA  ████████░░  74/100 — Bull Call Spread
-• AAPL  ██████░░░░  62/100 — Long Call
-• MSFT  █████░░░░░  55/100 — Bull Call Spread
-• SPY   ████░░░░░░  48/100 — Cash-Secured Put
-• QQQ   ████░░░░░░  46/100 — Cash-Secured Put
-
-Threshold: 65
-```
-
 ---
 
 ## Roadmap
 
-- [ ] Add earnings date detection (avoid selling into earnings)
-- [ ] Add 30-day trend via Tastytrade candle history
-- [ ] Add open interest from REST API (not in streaming)
-- [ ] Add portfolio Greeks tracker (net delta, theta)
-- [ ] Add position-aware alerts (e.g. "your NVDA call is up 80%")
+- [x] Live IV Rank, Greeks, bid/ask from Tastytrade
+- [x] 30-day trend via daily candle history
+- [x] Open interest from Summary streaming event
+- [x] Earnings detection — penalty for sellers, bonus for buyers
+- [x] Weekend/after-hours mode (last-close prices)
+- [x] Position monitor with take profit / stop loss / time stop alerts
+- [ ] Portfolio net Greeks tracker (total delta, theta, vega across all positions)
+- [ ] Earnings calendar overlay on watchlist scan
+- [ ] Multi-leg position grouping (show spread P&L as one unit)
