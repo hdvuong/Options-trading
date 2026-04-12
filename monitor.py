@@ -561,14 +561,7 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             next_earnings_date = m.earnings.expected_report_date  # a date object
 
         # Option chain structure
-        chain_list = await NestedOptionChain.get(session, ticker)
-
-        if not chain_list:
-            log.warning(f"  {ticker}: no option chain returned")
-            return None
-
-        chain = chain_list[0]
-
+        chain = await NestedOptionChain.get(session, ticker)
         if not chain.expirations:
             log.warning(f"  {ticker}: no expirations")
             return None
@@ -714,10 +707,12 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             bid = float(q.bid_price or 0) if q else 0.0
             ask = float(q.ask_price or 0) if q else 0.0
 
-            # Weekend/after-hours fallback: use last close price from Summary
+            # Fallback chain: live mid → Summary close → Greeks theoretical price
             last_price = (bid + ask) / 2 if ask > 0 else bid
             if last_price <= 0 and sm:
                 last_price = float(sm.day_close_price or sm.prev_day_close_price or 0)
+            if last_price <= 0 and g and g.price:
+                last_price = float(g.price)   # theoretical value from Greeks stream
             if last_price <= 0:
                 continue  # truly no data for this contract
 
@@ -738,9 +733,12 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             bid = float(q.bid_price or 0) if q else 0.0
             ask = float(q.ask_price or 0) if q else 0.0
 
+            # Fallback chain: live mid → Summary close → Greeks theoretical price
             last_price = (bid + ask) / 2 if ask > 0 else bid
             if last_price <= 0 and sm:
                 last_price = float(sm.day_close_price or sm.prev_day_close_price or 0)
+            if last_price <= 0 and g and g.price:
+                last_price = float(g.price)   # theoretical value from Greeks stream
             if last_price <= 0:
                 continue
 
@@ -755,8 +753,13 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             })
 
         if not call_rows or not put_rows:
-            log.warning(f"  {ticker}: insufficient options data for {best_exp}")
+            log.warning(f"  {ticker}: insufficient options data for {best_exp} "
+                        f"(calls={len(call_rows)}, puts={len(put_rows)}, "
+                        f"greeks={len(greeks_map)}, quotes={len(quotes)}, summary={len(summary_map)})")
             return None
+
+        log.info(f"  {ticker}: built chain — {len(call_rows)} calls, {len(put_rows)} puts "
+                 f"(greeks={len(greeks_map)}, quotes={len(quotes)})")
 
         return {
             "ticker":              ticker,
