@@ -710,6 +710,8 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
         if week52_low  <= 0: week52_low  = price * 0.7
 
         # Build chain DataFrames for best_exp only
+        log.info(f"  {ticker}: best_exp={best_exp}, exp_map keys={list(exp_map.keys())[:5]}")
+        log.info(f"  {ticker}: em calls={len(em_best.get('calls',{}))}, puts={len(em_best.get('puts',{}))}")
         em = exp_map.get(best_exp, {})
         call_rows, put_rows = [], []
         T = days_to_expiry(best_exp) / 365
