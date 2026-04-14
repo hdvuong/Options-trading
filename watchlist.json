@@ -1,5 +1,5 @@
 {
-  "tickers": ["NVDA", "AAPL", "MSFT", "SPY", "QQQ"],
+  "tickers": ["NVDA"],
 
   "alert": {
     "score_threshold": 65,
