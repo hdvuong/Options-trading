@@ -680,6 +680,11 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
 
                 if got_price and got_profile and not pending_g and not pending_q:
                     break
+                # On weekends/closed market: exit as soon as we have equity data
+                # (options stream won't return any data, no point waiting full timeout)
+                if got_price and got_profile and not market_status()[0]:
+                    log.info(f"  {ticker}: market closed, equity data received — skipping option stream wait")
+                    break
                 await asyncio.sleep(0.15)
 
         # Price fallback: use prev_day_close when market is closed (weekends/holidays)
@@ -707,6 +712,12 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
         # Build chain DataFrames for best_exp only
         em = exp_map.get(best_exp, {})
         call_rows, put_rows = [], []
+        T = days_to_expiry(best_exp) / 365
+        using_bs_fallback = len(greeks_map) == 0 and len(quotes) == 0
+
+        if using_bs_fallback:
+            log.info(f"  {ticker}: no stream data for options — using Black-Scholes fallback "
+                     f"(price=${price:.2f}, IV={iv_current*100:.0f}%)")
 
         for sym, strike in em.get("calls", {}).items():
             q  = quotes.get(sym)
@@ -715,22 +726,28 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             bid = float(q.bid_price or 0) if q else 0.0
             ask = float(q.ask_price or 0) if q else 0.0
 
-            # Fallback chain: live mid → Summary close → Greeks theoretical price
+            # Fallback chain: live mid → Summary close → Greeks theoretical → BS model
             last_price = (bid + ask) / 2 if ask > 0 else bid
             if last_price <= 0 and sm:
                 last_price = float(sm.day_close_price or sm.prev_day_close_price or 0)
             if last_price <= 0 and g and g.price:
-                last_price = float(g.price)   # theoretical value from Greeks stream
+                last_price = float(g.price)
+            if last_price <= 0 and T > 0:
+                last_price = bs_price(price, strike, T, 0.04, iv_current, "call")
+
             if last_price <= 0:
-                continue  # truly no data for this contract
+                continue
+
+            iv_used  = float(g.volatility or iv_current) if g else iv_current
+            delta    = float(g.delta or 0) if g else bs_delta(price, strike, T, 0.04, iv_current, "call")
 
             call_rows.append({
                 "strike":            strike,
                 "bid":               bid if bid > 0 else last_price * 0.98,
                 "ask":               ask if ask > 0 else last_price * 1.02,
                 "lastPrice":         last_price,
-                "impliedVolatility": max(0.01, float(g.volatility or iv_current) if g else iv_current),
-                "delta":             float(g.delta or 0.5) if g else 0.5,
+                "impliedVolatility": max(0.01, iv_used),
+                "delta":             delta,
                 "openInterest":      int(sm.open_interest or 0) if sm else 0,
             })
 
@@ -741,22 +758,27 @@ async def fetch_ticker(ticker: str, session: Session, cfg: dict) -> Optional[dic
             bid = float(q.bid_price or 0) if q else 0.0
             ask = float(q.ask_price or 0) if q else 0.0
 
-            # Fallback chain: live mid → Summary close → Greeks theoretical price
             last_price = (bid + ask) / 2 if ask > 0 else bid
             if last_price <= 0 and sm:
                 last_price = float(sm.day_close_price or sm.prev_day_close_price or 0)
             if last_price <= 0 and g and g.price:
-                last_price = float(g.price)   # theoretical value from Greeks stream
+                last_price = float(g.price)
+            if last_price <= 0 and T > 0:
+                last_price = bs_price(price, strike, T, 0.04, iv_current, "put")
+
             if last_price <= 0:
                 continue
+
+            iv_used = float(g.volatility or iv_current) if g else iv_current
+            delta   = float(g.delta or 0) if g else bs_delta(price, strike, T, 0.04, iv_current, "put")
 
             put_rows.append({
                 "strike":            strike,
                 "bid":               bid if bid > 0 else last_price * 0.98,
                 "ask":               ask if ask > 0 else last_price * 1.02,
                 "lastPrice":         last_price,
-                "impliedVolatility": max(0.01, float(g.volatility or iv_current) if g else iv_current),
-                "delta":             float(g.delta or -0.5) if g else -0.5,
+                "impliedVolatility": max(0.01, iv_used),
+                "delta":             delta,
                 "openInterest":      int(sm.open_interest or 0) if sm else 0,
             })
 
